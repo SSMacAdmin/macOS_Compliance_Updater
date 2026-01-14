@@ -1,6 +1,6 @@
 # Standalone Usage Guide
 
-## 🎯 Using the All-in-One Script
+## 🎯 Using the Script
 
 The `Update-IntuneMacOSCompliance.ps1` script works in **standalone mode** without any external configuration files or wrapper scripts.
 
@@ -181,50 +181,6 @@ Current minimum version: 13.5
 New minimum version: 13.7
 
 [WHATIF] Would update compliance policy to minimum version: 13.7
-```
-
----
-
-## 🔒 Security Best Practices
-
-### DON'T: Hardcode Secrets in Scripts
-
-❌ **Never do this:**
-```powershell
-# BAD - Don't hardcode secrets!
-.\Update-IntuneMacOSCompliance.ps1 `
-    -TenantId "xxx" `
-    -ClientId "xxx" `
-    -ClientSecret "super-secret-password-123"
-```
-
-### DO: Use Secure Storage
-
-✅ **Use environment variables:**
-```powershell
-# Store securely in environment
-$env:INTUNE_CLIENT_SECRET = "secret"
-```
-
-✅ **Or use Azure Key Vault:**
-```powershell
-Install-Module -Name Az.KeyVault
-Connect-AzAccount
-
-$secret = Get-AzKeyVaultSecret -VaultName "MyVault" -Name "IntuneSecret"
-$env:INTUNE_CLIENT_SECRET = $secret.SecretValueText
-
-.\Update-IntuneMacOSCompliance.ps1
-```
-
-✅ **Or use Windows Credential Manager:**
-```powershell
-# Store in Windows Credential Manager
-cmdkey /generic:IntuneClientSecret /user:ClientSecret /pass:your-secret
-
-# Retrieve when needed
-$cred = Get-StoredCredential -Target "IntuneClientSecret"
-$env:INTUNE_CLIENT_SECRET = $cred.GetNetworkCredential().Password
 ```
 
 ---
