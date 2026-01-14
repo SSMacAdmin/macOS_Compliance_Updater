@@ -235,7 +235,7 @@ COMPLIANCE POLICY UPDATE COMPLETE
 
 ---
 
-## Part 7: Set Up Monitoring (Optional but Recommended)
+## Part 7: Set Up Monitoring (Optional)
 
 ### Step 7.1: Configure Alerts
 
@@ -337,6 +337,12 @@ AzureDiagnostics
 - Click the failed job to see error details
 - Check the Output and Error streams
 - Review the script logs
+
+### Use the Diagnostics script
+- Upload the Diagnostics-Runbook.ps1 to the automation account
+- Run it and check the Output where it fails
+- Correct the failures
+- Re-Run the Diagnotics runbook
 
 ---
 
