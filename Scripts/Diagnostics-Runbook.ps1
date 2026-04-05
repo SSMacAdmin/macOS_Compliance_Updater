@@ -8,6 +8,11 @@
     2. Test authentication to Microsoft Graph
     3. Test API permissions
     4. Test policy access
+
+.NOTES
+    Author: Niklas Bruhn (SSMacAdmin)
+    Version: 3.0
+
 #>
 
 Write-Output "========================================="
@@ -18,16 +23,39 @@ Write-Output ""
 # Step 1: Load Variables
 Write-Output "[STEP 1] Loading Azure Automation Variables..."
 try {
-    $tenantId = Get-AutomationVariable -Name "INTUNE_TENANT_ID"
-    $clientId = Get-AutomationVariable -Name "INTUNE_CLIENT_ID"
-    $clientSecret = Get-AutomationVariable -Name "INTUNE_CLIENT_SECRET"
-    $policyId = Get-AutomationVariable -Name "INTUNE_POLICY_ID"
+    # Check if using managed identity
+    $useManagedIdentity = $false
+    try {
+        $miEnabled = Get-AutomationVariable -Name "USE_MANAGED_IDENTITY" -ErrorAction SilentlyContinue
+        if ($null -ne $miEnabled) { 
+            $useManagedIdentity = [bool]$miEnabled 
+        }
+    } catch { }
     
-    Write-Output "✓ All variables loaded successfully"
-    Write-Output "  Tenant ID: $($tenantId.Substring(0,8))..."
-    Write-Output "  Client ID: $($clientId.Substring(0,8))..."
-    Write-Output "  Secret length: $($clientSecret.Length) chars"
-    Write-Output "  Policy ID: $($policyId.Substring(0,8))..."
+    if ($useManagedIdentity) {
+        Write-Output "✓ Managed Identity mode detected"
+        Write-Output "  Authentication: System-assigned managed identity"
+        Write-Output "  No credentials needed"
+        
+        # Only need policy ID
+        $policyId = Get-AutomationVariable -Name "INTUNE_POLICY_ID"
+        Write-Output "  Policy ID: $($policyId.Substring(0,8))..."
+    }
+    else {
+        Write-Output "✓ Service Principal mode detected"
+        Write-Output "  Authentication: App registration with client secret"
+        
+        $tenantId = Get-AutomationVariable -Name "INTUNE_TENANT_ID"
+        $clientId = Get-AutomationVariable -Name "INTUNE_CLIENT_ID"
+        $clientSecret = Get-AutomationVariable -Name "INTUNE_CLIENT_SECRET"
+        $policyId = Get-AutomationVariable -Name "INTUNE_POLICY_ID"
+        
+        Write-Output "  Tenant ID: $($tenantId.Substring(0,8))..."
+        Write-Output "  Client ID: $($clientId.Substring(0,8))..."
+        Write-Output "  Secret length: $($clientSecret.Length) chars"
+        Write-Output "  Policy ID: $($policyId.Substring(0,8))..."
+    }
+    
     Write-Output ""
 }
 catch {
@@ -39,39 +67,69 @@ catch {
 # Step 2: Test Authentication
 Write-Output "[STEP 2] Testing Microsoft Graph Authentication..."
 try {
-    $body = @{
-        grant_type    = "client_credentials"
-        client_id     = $clientId
-        client_secret = $clientSecret
-        scope         = "https://graph.microsoft.com/.default"
+    if ($useManagedIdentity) {
+        Write-Output "Using Managed Identity authentication..."
+        
+        # Get token using Azure Automation's managed identity
+        $resourceUri = "https://graph.microsoft.com"
+        $tokenAuthUri = $env:IDENTITY_ENDPOINT + "?resource=$resourceUri&api-version=2019-08-01"
+        $response = Invoke-RestMethod -Method Get -Headers @{"X-IDENTITY-HEADER"=$env:IDENTITY_HEADER} -Uri $tokenAuthUri -ErrorAction Stop
+        
+        $accessToken = $response.access_token
+        
+        Write-Output "✓ Authentication successful (Managed Identity)"
+        Write-Output "  Token type: Bearer"
+        Write-Output "  Token length: $($accessToken.Length) chars"
+        Write-Output "  Authentication: System-assigned managed identity"
+    }
+    else {
+        Write-Output "Using Service Principal authentication..."
+        
+        $body = @{
+            grant_type    = "client_credentials"
+            client_id     = $clientId
+            client_secret = $clientSecret
+            scope         = "https://graph.microsoft.com/.default"
+        }
+        
+        $tokenUrl = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
+        $response = Invoke-RestMethod -Uri $tokenUrl -Method Post -Body $body -ErrorAction Stop
+        
+        $accessToken = [string]$response.access_token
+        
+        Write-Output "✓ Authentication successful (Service Principal)"
+        Write-Output "  Token type: $($response.token_type)"
+        Write-Output "  Token length: $($accessToken.Length) chars"
+        Write-Output "  Expires in: $($response.expires_in) seconds"
     }
     
-    $tokenUrl = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
-    $response = Invoke-RestMethod -Uri $tokenUrl -Method Post -Body $body -ErrorAction Stop
-    
-    $accessToken = [string]$response.access_token
-    
-    Write-Output "✓ Authentication successful"
-    Write-Output "  Token type: $($response.token_type)"
-    Write-Output "  Token length: $($accessToken.Length) chars"
-    Write-Output "  Expires in: $($response.expires_in) seconds"
     Write-Output ""
 }
 catch {
     Write-Output "✗ Authentication failed"
     Write-Output "  Error: $($_.Exception.Message)"
     
-    if ($_.Exception.Response) {
-        $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-        $responseBody = $reader.ReadToEnd()
-        Write-Output "  Response: $responseBody"
+    if ($useManagedIdentity) {
+        Write-Output ""
+        Write-Output "MANAGED IDENTITY ISSUE:"
+        Write-Output "  - Make sure System-assigned identity is enabled on Automation Account"
+        Write-Output "  - Make sure the managed identity has Graph API permissions"
+        Write-Output "  - See MANAGED-IDENTITY-MIGRATION.md for setup instructions"
+    }
+    else {
+        if ($_.Exception.Response) {
+            $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+            $responseBody = $reader.ReadToEnd()
+            Write-Output "  Response: $responseBody"
+        }
+        
+        Write-Output ""
+        Write-Output "COMMON CAUSES:"
+        Write-Output "  - Client secret has expired"
+        Write-Output "  - Client ID is incorrect"
+        Write-Output "  - Tenant ID is incorrect"
     }
     
-    Write-Output ""
-    Write-Output "COMMON CAUSES:"
-    Write-Output "  - Client secret has expired"
-    Write-Output "  - Client ID is incorrect"
-    Write-Output "  - Tenant ID is incorrect"
     Write-Output ""
     exit 1
 }
@@ -164,21 +222,47 @@ catch {
     exit 1
 }
 
-# Step 5: Test AppleDB API
-Write-Output "[STEP 5] Testing AppleDB API Access..."
+# Step 5: Test SOFA API
+Write-Output "[STEP 5] Testing SOFA API Access..."
 try {
-    $appleDBUrl = "https://api.appledb.dev/ios/macOS/main.json"
-    $macOSBuilds = Invoke-RestMethod -Uri $appleDBUrl -Method Get -ErrorAction Stop
+    $sofaUrl = "https://sofa.macadmins.io/v2/macos_data_feed.json"
+    $sofaData = Invoke-RestMethod -Uri $sofaUrl -Method Get -TimeoutSec 30 -ErrorAction Stop
     
-    Write-Output "✓ AppleDB API accessible"
-    Write-Output "  Retrieved $($macOSBuilds.Count) macOS builds"
-    Write-Output ""
+    if ($null -eq $sofaData -or $null -eq $sofaData.OSVersions) {
+        Write-Output "✗ SOFA API failed"
+        Write-Output "  Error: No OS versions returned"
+        Write-Output ""
+    }
+    else {
+        # Count total versions across all major releases
+        $totalVersions = 0
+        foreach ($majorVersion in $sofaData.OSVersions) {
+            if ($majorVersion.Latest) { $totalVersions++ }
+            if ($majorVersion.SecurityReleases) { $totalVersions += $majorVersion.SecurityReleases.Count }
+        }
+        
+        Write-Output "✓ SOFA API accessible"
+        Write-Output "  Retrieved $totalVersions macOS versions"
+        Write-Output "  Source: MacAdmins SOFA feed"
+        Write-Output "  URL: $sofaUrl"
+        Write-Output ""
+        
+        # Show latest version from each major release
+        Write-Output "Latest versions by major release:"
+        foreach ($majorVersion in $sofaData.OSVersions | Select-Object -First 3) {
+            if ($majorVersion.Latest) {
+                $latest = $majorVersion.Latest
+                Write-Output "  - macOS $($latest.ProductVersion) (Build: $($latest.Build))"
+            }
+        }
+        Write-Output ""
+    }
 }
 catch {
-    Write-Output "✗ AppleDB API failed"
+    Write-Output "✗ SOFA API failed"
     Write-Output "  Error: $($_.Exception.Message)"
     Write-Output ""
-    Write-Output "This may be a temporary issue. Check https://appledb.dev"
+    Write-Output "This may be a network issue. Check connectivity to sofa.macadmins.io"
     Write-Output ""
 }
 

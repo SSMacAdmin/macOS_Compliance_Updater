@@ -41,7 +41,7 @@
     
 .EXAMPLE
     # Standalone execution with parameters
-    .\Update-IntuneMacOSCompliance.ps1 -TenantId "xxx" -ClientId "xxx" -ClientSecret "xxx" -CompliancePolicyId "xxx"
+    .\Update-IntuneMacOSCompliance-AllInOne.ps1 -TenantId "xxx" -ClientId "xxx" -ClientSecret "xxx" -CompliancePolicyId "xxx"
     
 .EXAMPLE
     # Standalone with environment variables
@@ -49,24 +49,24 @@
     $env:INTUNE_CLIENT_ID = "xxx"
     $env:INTUNE_CLIENT_SECRET = "xxx"
     $env:INTUNE_POLICY_ID = "xxx"
-    .\Update-IntuneMacOSCompliance.ps1
+    .\Update-IntuneMacOSCompliance-AllInOne.ps1
     
 .EXAMPLE
     # Azure Automation (credentials stored as Azure Automation variables)
-    .\Update-IntuneMacOSCompliance.ps1 -CompliancePolicyId "xxx"
+    .\Update-IntuneMacOSCompliance-AllInOne.ps1 -CompliancePolicyId "xxx"
     
 .EXAMPLE
     # Pin to macOS 15 and stay 2 minor versions behind
     # If latest is 15.7, sets minimum to 15.5 (ignores macOS 16.x)
-    .\Update-IntuneMacOSCompliance.ps1 -PinToMajorVersion 15 -VersionsBelow 2
+    .\Update-IntuneMacOSCompliance-AllInOne.ps1 -PinToMajorVersion 15 -VersionsBelow 2
     
 .EXAMPLE
     # Test mode
-    .\Update-IntuneMacOSCompliance.ps1 -WhatIf -RunTests
+    .\Update-IntuneMacOSCompliance-AllInOne.ps1 -WhatIf -RunTests
     
 .NOTES
-    Author: SSMacAdmin
-    Version: 2.0 
+    Author: Niklas Bruhn (SSMacAdmin)
+    Version: 3.0
     
     Azure Automation Setup:
     1. Create Azure Automation Account
@@ -75,6 +75,7 @@
        - INTUNE_CLIENT_ID
        - INTUNE_CLIENT_SECRET (encrypted)
        - INTUNE_POLICY_ID
+       - USE_MANAGED_IDENTITY
     3. Upload this script as a Runbook
     4. Schedule it to run weekly
     
@@ -110,6 +111,9 @@ param(
     
     [Parameter(Mandatory = $false)]
     [int]$PinToMajorVersion,
+    
+    [Parameter(Mandatory = $false)]
+    [switch]$UseManagedIdentity,
     
     [Parameter(Mandatory = $false)]
     [switch]$WhatIf,
@@ -191,9 +195,27 @@ function Get-Configuration {
     if ($script:isAzureAutomation) {
         Write-Log "Loading credentials from Azure Automation variables..." -Level INFO
         try {
-            $config.TenantId = Get-AutomationVariable -Name "INTUNE_TENANT_ID"
-            $config.ClientId = Get-AutomationVariable -Name "INTUNE_CLIENT_ID"
-            $config.ClientSecret = Get-AutomationVariable -Name "INTUNE_CLIENT_SECRET"
+            # Check if managed identity is enabled
+            $useManagedIdentity = $false
+            try {
+                $miEnabled = Get-AutomationVariable -Name "USE_MANAGED_IDENTITY" -ErrorAction SilentlyContinue
+                if ($null -ne $miEnabled) { 
+                    $useManagedIdentity = [bool]$miEnabled 
+                    if ($useManagedIdentity) {
+                        Write-Log "Managed Identity mode enabled" -Level INFO
+                    }
+                }
+            } catch { }
+            
+            $config.UseManagedIdentity = $useManagedIdentity
+            
+            if (-not $useManagedIdentity) {
+                # Load service principal credentials
+                $config.TenantId = Get-AutomationVariable -Name "INTUNE_TENANT_ID"
+                $config.ClientId = Get-AutomationVariable -Name "INTUNE_CLIENT_ID"
+                $config.ClientSecret = Get-AutomationVariable -Name "INTUNE_CLIENT_SECRET"
+            }
+            
             $config.CompliancePolicyId = Get-AutomationVariable -Name "INTUNE_POLICY_ID"
             
             # Load optional configuration variables
@@ -215,6 +237,7 @@ function Get-Configuration {
             # Allow parameter overrides
             if ($CompliancePolicyId) { $config.CompliancePolicyId = $CompliancePolicyId }
             if ($PinToMajorVersion) { $config.PinToMajorVersion = $PinToMajorVersion }
+            if ($UseManagedIdentity) { $config.UseManagedIdentity = $true }
             
             Write-Log "Successfully loaded credentials from Azure Automation" -Level SUCCESS
         }
@@ -240,10 +263,18 @@ function Get-Configuration {
     
     # Validate configuration
     $missingConfig = @()
-    if ([string]::IsNullOrWhiteSpace($config.TenantId)) { $missingConfig += "TenantId" }
-    if ([string]::IsNullOrWhiteSpace($config.ClientId)) { $missingConfig += "ClientId" }
-    if ([string]::IsNullOrWhiteSpace($config.ClientSecret)) { $missingConfig += "ClientSecret" }
-    if ([string]::IsNullOrWhiteSpace($config.CompliancePolicyId)) { $missingConfig += "CompliancePolicyId" }
+    
+    if ($config.UseManagedIdentity) {
+        # Managed Identity only needs Policy ID
+        if ([string]::IsNullOrWhiteSpace($config.CompliancePolicyId)) { $missingConfig += "CompliancePolicyId" }
+    }
+    else {
+        # Service Principal needs all credentials
+        if ([string]::IsNullOrWhiteSpace($config.TenantId)) { $missingConfig += "TenantId" }
+        if ([string]::IsNullOrWhiteSpace($config.ClientId)) { $missingConfig += "ClientId" }
+        if ([string]::IsNullOrWhiteSpace($config.ClientSecret)) { $missingConfig += "ClientSecret" }
+        if ([string]::IsNullOrWhiteSpace($config.CompliancePolicyId)) { $missingConfig += "CompliancePolicyId" }
+    }
     
     if ($missingConfig.Count -gt 0) {
         Write-Log "Missing required configuration: $($missingConfig -join ', ')" -Level ERROR
@@ -252,17 +283,31 @@ function Get-Configuration {
             Write-Log "Create these variables in your Azure Automation Account" -Level ERROR
         }
         else {
-            Write-Log "Provide them as parameters or set environment variables:" -Level ERROR
-            Write-Log "  `$env:INTUNE_TENANT_ID = 'your-tenant-id'" -Level ERROR
-            Write-Log "  `$env:INTUNE_CLIENT_ID = 'your-client-id'" -Level ERROR
-            Write-Log "  `$env:INTUNE_CLIENT_SECRET = 'your-secret'" -Level ERROR
-            Write-Log "  `$env:INTUNE_POLICY_ID = 'your-policy-id'" -Level ERROR
+            if ($config.UseManagedIdentity) {
+                Write-Log "Managed Identity mode requires:" -Level ERROR
+                Write-Log "  INTUNE_POLICY_ID variable" -Level ERROR
+            }
+            else {
+                Write-Log "Provide them as parameters or set environment variables:" -Level ERROR
+                Write-Log "  `$env:INTUNE_TENANT_ID = 'your-tenant-id'" -Level ERROR
+                Write-Log "  `$env:INTUNE_CLIENT_ID = 'your-client-id'" -Level ERROR
+                Write-Log "  `$env:INTUNE_CLIENT_SECRET = 'your-secret'" -Level ERROR
+                Write-Log "  `$env:INTUNE_POLICY_ID = 'your-policy-id'" -Level ERROR
+            }
         }
         throw "Configuration incomplete"
     }
     
     Write-Log "Configuration loaded successfully" -Level SUCCESS
-    Write-Log "  Tenant ID: $($config.TenantId.Substring(0,8))..." -Level DEBUG
+    
+    if ($config.UseManagedIdentity) {
+        Write-Log "  Authentication: Managed Identity" -Level DEBUG
+    }
+    else {
+        Write-Log "  Authentication: Service Principal" -Level DEBUG
+        Write-Log "  Tenant ID: $($config.TenantId.Substring(0,8))..." -Level DEBUG
+    }
+    
     Write-Log "  Policy ID: $($config.CompliancePolicyId.Substring(0,8))..." -Level DEBUG
     Write-Log "  Versions Below: $($config.VersionsBelow)" -Level DEBUG
     Write-Log "  Use Minor Versions: $($config.UseMinorVersions)" -Level DEBUG
@@ -335,25 +380,72 @@ function Test-Prerequisites {
 }
 
 # ============================================================================
-# GET MACOS VERSIONS FROM APPLEDB
+# GET MACOS VERSIONS FROM SOFA (MacAdmins Feed)
 # ============================================================================
 function Get-MacOSVersionsFromAppleDB {
-    Write-Log "Fetching macOS versions from AppleDB API..." -Level INFO
+    Write-Log "Fetching macOS versions from SOFA (MacAdmins feed)..." -Level INFO
     
     try {
-        $apiUrl = "https://api.appledb.dev/ios/macOS/main.json"
-        $response = Invoke-RestMethod -Uri $apiUrl -Method Get -ErrorAction Stop
+        # SOFA provides a curated, lightweight feed specifically for macAdmins
+        # Much smaller than AppleDB's full 2800+ build dataset
+        # Updated every 6 hours by GitHub Actions
+        # https://sofa.macadmins.io
         
-        if ($null -eq $response -or $response.Count -eq 0) {
-            throw "No data returned from AppleDB API"
+        $sofaUrl = "https://sofa.macadmins.io/v2/macos_data_feed.json"
+        
+        Write-Log "Querying SOFA API for macOS versions..." -Level DEBUG
+        $response = Invoke-RestMethod -Uri $sofaUrl -Method Get -TimeoutSec 30 -ErrorAction Stop
+        
+        if ($null -eq $response -or $null -eq $response.OSVersions) {
+            throw "No OS versions returned from SOFA API"
         }
         
-        Write-Log "Successfully retrieved $($response.Count) macOS builds from AppleDB" -Level SUCCESS
-        return $response
+        Write-Log "Successfully retrieved data from SOFA" -Level SUCCESS
+        
+        # SOFA provides data organized by major version
+        # OSVersions array contains entries for each major version (26, 15, 14, etc.)
+        # Each entry has Latest, SecurityReleases, and other metadata
+        
+        $allVersions = @()
+        
+        foreach ($majorVersion in $response.OSVersions) {
+            # Add the latest version for this major release
+            if ($majorVersion.Latest) {
+                $latest = $majorVersion.Latest
+                $allVersions += @{
+                    version = $latest.ProductVersion
+                    build = $latest.Build
+                    released = $true
+                    releaseDate = $latest.ReleaseDate
+                }
+            }
+            
+            # Add all security releases for this major version
+            if ($majorVersion.SecurityReleases) {
+                foreach ($security in $majorVersion.SecurityReleases) {
+                    $allVersions += @{
+                        version = $security.ProductVersion
+                        build = $security.Build
+                        released = $true
+                        releaseDate = $security.ReleaseDate
+                    }
+                }
+            }
+        }
+        
+        Write-Log "Parsed $($allVersions.Count) macOS versions from SOFA feed" -Level SUCCESS
+        Write-Log "SOFA data source: https://sofa.macadmins.io" -Level INFO
+        
+        return $allVersions
+    }
+    catch [System.OutOfMemoryException] {
+        Write-Log "Out of memory when fetching SOFA data." -Level ERROR
+        throw "Memory error fetching version data. Contact support or upgrade Automation tier."
     }
     catch {
-        Write-Log "Failed to fetch macOS versions from AppleDB: $($_.Exception.Message)" -Level ERROR
-        throw
+        Write-Log "Failed to fetch macOS versions from SOFA: $($_.Exception.Message)" -Level ERROR
+        Write-Log "SOFA URL: $sofaUrl" -Level ERROR
+        throw "Failed to retrieve macOS version data from SOFA API: $($_.Exception.Message)"
     }
 }
 
@@ -374,25 +466,29 @@ function Get-LatestMacOSVersions {
     
     Write-Log "Parsing macOS versions..." -Level INFO
     
-    # Filter for released versions only (not beta/RC)
+    # MacOSBuilds is already filtered to released versions
     $releasedVersions = $MacOSBuilds | Where-Object {
-        $_.released -and 
-        $_.version -match '^\d+\.\d+' -and
-        -not ($_.beta -or $_.rc -or $_.version -match 'beta|rc|preview|seed')
+        $_.version -notmatch 'beta|rc|preview|seed'
     }
     
     Write-Log "Found $($releasedVersions.Count) released macOS versions" -Level INFO
     
-    # Parse versions and create custom objects
-    $parsedVersions = @()
+    # Parse versions - process in chunks to avoid memory issues
+    $parsedVersions = [System.Collections.Generic.List[PSObject]]::new()
     
     foreach ($build in $releasedVersions) {
         if ($build.version -match '^(\d+)\.(\d+)(?:\.(\d+))?') {
             $major = [int]$Matches[1]
+            
+            # If pinned, skip versions that don't match early
+            if ($PinToMajorVersion -and $major -ne $PinToMajorVersion) {
+                continue
+            }
+            
             $minor = [int]$Matches[2]
             $patch = if ($Matches[3]) { [int]$Matches[3] } else { 0 }
             
-            $parsedVersions += [PSCustomObject]@{
+            $parsedVersions.Add([PSCustomObject]@{
                 Version      = $build.version
                 Build        = $build.build
                 MajorVersion = $major
@@ -401,14 +497,19 @@ function Get-LatestMacOSVersions {
                 Released     = $build.released
                 ReleaseDate  = if ($build.releaseDate) { $build.releaseDate } else { "Unknown" }
                 FullVersion  = "$major.$minor.$patch"
-            }
+            })
         }
     }
+    
+    # Clear source data from memory
+    $releasedVersions = $null
+    $MacOSBuilds = $null
+    [System.GC]::Collect()
     
     # Sort by version (descending)
     $sortedVersions = $parsedVersions | Sort-Object MajorVersion, MinorVersion, PatchVersion -Descending
     
-    # Filter by major version if pinned
+    # Filter by major version if pinned (should already be filtered, but double-check)
     if ($PinToMajorVersion) {
         Write-Log "Filtering to only macOS $PinToMajorVersion.x versions..." -Level INFO
         $sortedVersions = $sortedVersions | Where-Object { $_.MajorVersion -eq $PinToMajorVersion }
@@ -484,37 +585,65 @@ function Get-TargetMacOSVersion {
 # ============================================================================
 function Get-GraphAccessToken {
     param(
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $false)]
         [string]$TenantId,
         
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory = $false)]
         [string]$ClientId,
         
-        [Parameter(Mandatory = $true)]
-        [string]$ClientSecret
+        [Parameter(Mandatory = $false)]
+        [string]$ClientSecret,
+        
+        [Parameter(Mandatory = $false)]
+        [switch]$UseManagedIdentity
     )
     
-    Write-Log "Authenticating to Microsoft Graph..." -Level INFO
-    
-    try {
-        $body = @{
-            grant_type    = "client_credentials"
-            client_id     = $ClientId
-            client_secret = $ClientSecret
-            scope         = "https://graph.microsoft.com/.default"
+    if ($UseManagedIdentity) {
+        Write-Log "Authenticating using Managed Identity..." -Level INFO
+        Write-Log "Using Azure Automation's system-assigned managed identity" -Level INFO
+        
+        try {
+            # Get token using Azure Automation's managed identity
+            $resourceUri = "https://graph.microsoft.com"
+            $tokenAuthUri = $env:IDENTITY_ENDPOINT + "?resource=$resourceUri&api-version=2019-08-01"
+            $tokenResponse = Invoke-RestMethod -Method Get -Headers @{"X-IDENTITY-HEADER"=$env:IDENTITY_HEADER} -Uri $tokenAuthUri
+            
+            Write-Log "Successfully authenticated using Managed Identity" -Level SUCCESS
+            Write-Log "Authentication method: System-assigned managed identity (no credentials required)" -Level SUCCESS
+            return $tokenResponse.access_token
         }
-        
-        $tokenUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
-        $response = Invoke-RestMethod -Uri $tokenUrl -Method Post -Body $body -ErrorAction Stop
-        
-        Write-Log "Successfully authenticated to Microsoft Graph" -Level SUCCESS
-        
-        # Return the access_token directly - let PowerShell handle type conversion
-        return $response.access_token
+        catch {
+            Write-Log "Failed to authenticate using Managed Identity: $($_.Exception.Message)" -Level ERROR
+            Write-Log "Make sure System-assigned identity is enabled on the Automation Account" -Level ERROR
+            Write-Log "Make sure the managed identity has DeviceManagementConfiguration.ReadWrite.All permission" -Level ERROR
+            throw
+        }
     }
-    catch {
-        Write-Log "Failed to authenticate to Microsoft Graph: $($_.Exception.Message)" -Level ERROR
-        throw
+    else {
+        Write-Log "Authenticating to Microsoft Graph..." -Level INFO
+        Write-Log "Using Service Principal (App Registration) authentication" -Level INFO
+        
+        try {
+            $body = @{
+                grant_type    = "client_credentials"
+                client_id     = $ClientId
+                client_secret = $ClientSecret
+                scope         = "https://graph.microsoft.com/.default"
+            }
+            
+            $tokenUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+            $response = Invoke-RestMethod -Uri $tokenUrl -Method Post -Body $body -ErrorAction Stop
+            
+            Write-Log "Successfully authenticated to Microsoft Graph" -Level SUCCESS
+            Write-Log "Authentication method: Service Principal with client secret" -Level SUCCESS
+            
+            # Return the access_token directly - let PowerShell handle type conversion
+            return $response.access_token
+        }
+        catch {
+            Write-Log "Failed to authenticate to Microsoft Graph: $($_.Exception.Message)" -Level ERROR
+            throw
+        }
     }
 }
 
@@ -656,7 +785,12 @@ function Main {
         Write-Log "" -Level INFO
         
         # Step 4: Authenticate to Microsoft Graph
-        $accessToken = Get-GraphAccessToken -TenantId $config.TenantId -ClientId $config.ClientId -ClientSecret $config.ClientSecret
+        if ($config.UseManagedIdentity) {
+            $accessToken = Get-GraphAccessToken -UseManagedIdentity
+        }
+        else {
+            $accessToken = Get-GraphAccessToken -TenantId $config.TenantId -ClientId $config.ClientId -ClientSecret $config.ClientSecret
+        }
         
         # Step 5: Get current compliance policy
         $currentPolicy = Get-IntuneCompliancePolicy -AccessToken $accessToken -PolicyId $config.CompliancePolicyId
@@ -707,6 +841,7 @@ function Main {
             PreviousVersion    = $currentPolicy.osMinimumVersion
             NewVersion         = $targetVersion.FullVersion
             Updated            = ($currentPolicy.osMinimumVersion -ne $targetVersion.FullVersion)
+            AuthMethod         = if ($config.UseManagedIdentity) { "Managed Identity" } else { "Service Principal" }
             Duration           = $duration.TotalSeconds
             Timestamp          = Get-Date -Format 'o'
         }
