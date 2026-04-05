@@ -82,7 +82,6 @@ Follow this section if you chose **Managed Identity** authentication.
    - Click **Save** → **Yes**
 4. **Copy the Object (principal) ID** - you'll need this next
 
-![Managed Identity enabled](https://docs.microsoft.com/en-us/azure/automation/media/enable-managed-identity/system-assigned-managed-identity.png)
 
 ### Step 2A.2: Grant Microsoft Graph Permissions
 
